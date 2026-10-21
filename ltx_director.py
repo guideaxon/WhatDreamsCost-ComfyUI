@@ -28,7 +28,7 @@ from .prompt_relay import (
     distribute_segment_lengths,
 )
 
-from .security_utils import is_same_origin_request, safe_join
+from .security_utils import is_same_origin_request, safe_join, resolve_input_file
 
 from .patches import detect_model_type, apply_patches, get_current_node_id
 import weakref
@@ -386,7 +386,12 @@ async def ltx_director_upload_chunk(request):
     if file_path is None:
         return web.json_response({"error": "Invalid filename"}, status=400)
 
-    # Append chunk to file (write fresh on first chunk, append on subsequent)
+    # Stream into "<name>.part" and only rename on the last chunk, so an upload can never truncate
+    # or extend an already-finished file in the input folder.
+    final_path = file_path
+    file_path = final_path + ".part"
+    if chunk_index > 0 and not os.path.isfile(file_path):
+        return web.json_response({"error": "Upload not started"}, status=400)
     mode = "ab" if chunk_index > 0 else "wb"
     
     # Offload the blocking read/write disk I/O to a thread executor
@@ -394,6 +399,8 @@ async def ltx_director_upload_chunk(request):
     await loop.run_in_executor(None, _read_and_write_file_chunk, file, file_path, mode)
 
     if chunk_index == total_chunks - 1:
+        os.replace(file_path, final_path)
+        file_path = final_path
         audio_file, peaks = None, None
         try:
             audio_file, peaks = await loop.run_in_executor(None, extract_audio_from_video, file_path)
@@ -413,8 +420,8 @@ def _load_image_tensor(seg: dict) -> torch.Tensor:
     """Decode an image from the ComfyUI input folder (if imageFile provided) or fallback to base64
     to a ComfyUI-style image tensor of shape [1, H, W, 3], float32 in [0, 1]."""
     if seg.get("imageFile"):
-        file_path = os.path.join(folder_paths.get_input_directory(), seg["imageFile"])
-        if os.path.exists(file_path):
+        file_path = resolve_input_file(folder_paths.get_input_directory(), seg["imageFile"])
+        if file_path:
             img = Image.open(file_path).convert("RGB")
             arr = np.array(img, dtype=np.float32) / 255.0
             return torch.from_numpy(arr).unsqueeze(0)
@@ -437,9 +444,9 @@ def _load_image_tensor(seg: dict) -> torch.Tensor:
 def _load_video_tensor(seg: dict, frame_rate: float) -> torch.Tensor:
     """Extracts a sequence of frames from a video file based on the segment's trim parameters,
     and returns them as an [N, H, W, 3] float32 tensor."""
-    file_path = os.path.join(folder_paths.get_input_directory(), seg.get("imageFile", ""))
+    file_path = resolve_input_file(folder_paths.get_input_directory(), seg.get("imageFile", ""))
     
-    if not os.path.exists(file_path):
+    if not file_path:
         return torch.zeros((1, 512, 512, 3), dtype=torch.float32)
 
     trim_start_frames = float(seg.get("trimStart", 0))
@@ -640,15 +647,9 @@ def _build_combined_audio(timeline_data_str: str, start_frame: int, duration_fra
         buffer = None
         file_key = "videoFile" if override_audio else "audioFile"
         if seg.get(file_key):
-            file_path = os.path.join(folder_paths.get_input_directory(), seg[file_key])
-            if not os.path.exists(file_path):
-                # Try fallback under whatdreamscost subfolder
-                basename = os.path.basename(seg[file_key])
-                fallback_path = os.path.join(folder_paths.get_input_directory(), "whatdreamscost", basename)
-                if os.path.exists(fallback_path):
-                    file_path = fallback_path
+            file_path = resolve_input_file(folder_paths.get_input_directory(), seg[file_key])
 
-            if os.path.exists(file_path):
+            if file_path:
                 with open(file_path, "rb") as f:
                     buffer = _io.BytesIO(f.read())
         
@@ -1124,13 +1125,8 @@ class LTXDirector(io.ComfyNode):
                 retake_vid = tdata_motion.get("retakeVideo") or {}
                 retake_file = retake_vid.get("imageFile", "") if isinstance(retake_vid, dict) else ""
                 if is_retake and retake_file:
-                    r_path = os.path.join(folder_paths.get_input_directory(), retake_file)
-                    if not os.path.exists(r_path):
-                        basename = os.path.basename(retake_file)
-                        fallback_path = os.path.join(folder_paths.get_input_directory(), "whatdreamscost", basename)
-                        if os.path.exists(fallback_path):
-                            r_path = fallback_path
-                    if os.path.exists(r_path):
+                    r_path = resolve_input_file(folder_paths.get_input_directory(), retake_file)
+                    if r_path:
                         try:
                             with av.open(r_path) as container:
                                 stream = container.streams.video[0]
@@ -1145,13 +1141,8 @@ class LTXDirector(io.ComfyNode):
                     for mseg in tdata_motion.get("motionSegments", []):
                         v_file = mseg.get("videoFile")
                         if v_file:
-                            v_path = os.path.join(folder_paths.get_input_directory(), v_file)
-                            if not os.path.exists(v_path):
-                                basename = os.path.basename(v_file)
-                                fallback_path = os.path.join(folder_paths.get_input_directory(), "whatdreamscost", basename)
-                                if os.path.exists(fallback_path):
-                                    v_path = fallback_path
-                            if os.path.exists(v_path):
+                            v_path = resolve_input_file(folder_paths.get_input_directory(), v_file)
+                            if v_path:
                                 try:
                                     with av.open(v_path) as container:
                                         stream = container.streams.video[0]

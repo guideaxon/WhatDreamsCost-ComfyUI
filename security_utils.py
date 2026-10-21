@@ -64,3 +64,27 @@ def safe_join(base_dir, user_path):
     if not inside or os.path.normcase(candidate_real) == base_real:
         return None
     return candidate_real
+
+
+def resolve_input_file(input_dir, rel_path, fallback_subdir="whatdreamscost"):
+    """Locate an existing file for a workflow-supplied name, confined to input_dir.
+
+    Tries input_dir/rel_path, then input_dir/fallback_subdir/<basename>. Returns None if neither
+    exists or the name tries to escape input_dir (absolute path, "..", symlink out).
+    """
+    if not isinstance(rel_path, str) or not rel_path:
+        return None
+    rel_path = rel_path.replace("\\", "/")
+    for base, name in (
+        (input_dir, rel_path),
+        (os.path.join(input_dir, fallback_subdir), os.path.basename(rel_path)),
+    ):
+        candidate = safe_join(base, name)
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def has_allowed_extension(path, extensions):
+    """True if the fully resolved path (symlinks followed) ends with one of the allowed extensions."""
+    return os.path.realpath(path).lower().endswith(tuple(extensions))

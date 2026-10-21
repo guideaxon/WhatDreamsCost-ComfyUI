@@ -7,6 +7,10 @@ import folder_paths
 import io
 import comfy.utils
 
+from .security_utils import has_allowed_extension
+
+_ALLOWED_IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif', '.tif', '.tiff')
+
 class MultiImageLoader:
     @classmethod
     def INPUT_TYPES(s):
@@ -149,6 +153,10 @@ class MultiImageLoader:
                     
                 if not os.path.exists(full_path):
                     print(f"Warning: Image path not found: {path}")
+                    continue
+
+                if not has_allowed_extension(full_path, _ALLOWED_IMAGE_EXTENSIONS):
+                    print(f"Warning: Unsupported image file type, skipping: {path}")
                     continue
 
                 # Load image

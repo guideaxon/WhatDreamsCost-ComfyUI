@@ -8,7 +8,7 @@ from server import PromptServer
 from aiohttp import web
 import comfy.utils
 
-from .security_utils import is_same_origin_request, safe_join
+from .security_utils import is_same_origin_request, safe_join, has_allowed_extension
 
 # Only these extensions may be served/written through the routes below, limiting the blast
 # radius of the arbitrary-path preview feature and the chunked upload endpoint.
@@ -66,7 +66,12 @@ async def upload_chunk(request):
     if file_path is None:
         return web.json_response({"error": "Invalid filename"}, status=400)
 
-    # Append to file if it's not the first chunk, otherwise write new
+    # Stream into "<name>.part" and only rename on the last chunk, so an upload can never truncate
+    # or extend an already-finished file in the input folder.
+    final_path = file_path
+    file_path = final_path + ".part"
+    if chunk_index > 0 and not os.path.isfile(file_path):
+        return web.json_response({"error": "Upload not started"}, status=400)
     mode = "ab" if chunk_index > 0 else "wb"
     
     # Offload the blocking read/write disk I/O to a thread executor
@@ -74,6 +79,8 @@ async def upload_chunk(request):
     await loop.run_in_executor(None, _read_and_write_file_chunk, file, file_path, mode)
 
     if chunk_index == total_chunks - 1:
+        os.replace(file_path, final_path)
+        file_path = final_path
         return web.json_response({"name": safe_filename})
     return web.json_response({"status": "ok"})
 
@@ -147,6 +154,11 @@ class LoadVideoUI:
                     video_path = video_path_input
                 else:
                     raise FileNotFoundError(f"Video file not found: {video}")
+
+        # Absolute paths are allowed for convenience, but only for video files, so a shared workflow
+        # can't use this node to read arbitrary files (keys, configs, ...).
+        if not has_allowed_extension(video_path, _ALLOWED_VIDEO_EXTENSIONS):
+            raise ValueError(f"Unsupported video file type: {video}")
 
         # Open container to read streams and metadata
         container = av.open(video_path)
