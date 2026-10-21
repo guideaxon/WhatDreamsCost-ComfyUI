@@ -28,6 +28,8 @@ from .prompt_relay import (
     distribute_segment_lengths,
 )
 
+from .security_utils import is_same_origin_request, safe_join
+
 from .patches import detect_model_type, apply_patches, get_current_node_id
 import weakref
 
@@ -69,6 +71,9 @@ MotionGuideData = io.Custom("MOTION_GUIDE_DATA")
 # --- File Check Endpoint for Deduplication ---
 @PromptServer.instance.routes.get("/ltx_director_check_file")
 async def ltx_director_check_file(request):
+    if not is_same_origin_request(request):
+        return web.Response(status=403, text="Forbidden")
+
     filename = request.query.get("filename", "")
     file_size = request.query.get("size", "")
     if not filename:
@@ -77,11 +82,9 @@ async def ltx_director_check_file(request):
     upload_dir = folder_paths.get_input_directory()
     temp_dir = os.path.join(upload_dir, "whatdreamscost")
     
-    # 1. Check if the exact filename exists in whatdreamscost or root input dir
-    possible_paths = [
-        os.path.join(temp_dir, filename),
-        os.path.join(upload_dir, filename)
-    ]
+    # 1. Check if the exact filename exists in whatdreamscost or root input dir.
+    # safe_join rejects path traversal (e.g. "../../etc/passwd") so possible_paths never escape these dirs.
+    possible_paths = [p for p in (safe_join(temp_dir, filename), safe_join(upload_dir, filename)) if p is not None]
     
     found_path = None
     for p in possible_paths:
@@ -276,6 +279,9 @@ def get_audio_peaks(audio_path):
 
 @PromptServer.instance.routes.get("/ltx_director_get_audio")
 async def ltx_director_get_audio(request):
+    if not is_same_origin_request(request):
+        return web.Response(status=403, text="Forbidden")
+
     filename = request.query.get("filename")
     if not filename:
         return web.json_response({"error": "Missing filename"}, status=400)
@@ -283,16 +289,18 @@ async def ltx_director_get_audio(request):
     upload_dir = folder_paths.get_input_directory()
     
     clean_filename = filename.replace('\\', '/')
-    file_path = os.path.join(upload_dir, clean_filename)
-    if not os.path.exists(file_path):
+    # safe_join rejects path traversal (e.g. "../../etc/passwd"); fall back to a basename-only
+    # lookup confined to the upload dir if the raw filename tries to escape it.
+    file_path = safe_join(upload_dir, clean_filename)
+    if file_path is None or not os.path.exists(file_path):
         basename = os.path.basename(clean_filename)
-        temp_path = os.path.join(upload_dir, "whatdreamscost", basename)
-        if os.path.exists(temp_path):
+        temp_path = safe_join(upload_dir, os.path.join("whatdreamscost", basename))
+        if temp_path and os.path.exists(temp_path):
             file_path = temp_path
         else:
-            file_path = os.path.join(upload_dir, basename)
-        
-    if not os.path.exists(file_path) or not os.path.isfile(file_path):
+            file_path = safe_join(upload_dir, basename)
+
+    if not file_path or not os.path.exists(file_path) or not os.path.isfile(file_path):
         return web.json_response({"error": "File not found"}, status=404)
 
     _, ext = os.path.splitext(file_path)
@@ -326,6 +334,9 @@ async def ltx_director_get_audio(request):
 
 @PromptServer.instance.routes.get("/ltx_director_open_folder")
 async def ltx_director_open_folder(request):
+    if not is_same_origin_request(request):
+        return web.Response(status=403, text="Forbidden")
+
     upload_dir = os.path.join(folder_paths.get_input_directory(), "whatdreamscost")
     os.makedirs(upload_dir, exist_ok=True)
     try:
@@ -351,21 +362,28 @@ def _read_and_write_file_chunk(file, file_path, mode):
 # This endpoint is self-contained and independent of any other node.
 @PromptServer.instance.routes.post("/ltx_director_upload_chunk")
 async def ltx_director_upload_chunk(request):
+    if not is_same_origin_request(request):
+        return web.Response(status=403, text="Forbidden")
+
     post = await request.post()
     file = post.get("file")
     filename = post.get("filename")
-    chunk_index = int(post.get("chunk_index"))
-    total_chunks = int(post.get("total_chunks"))
+    try:
+        chunk_index = int(post.get("chunk_index"))
+        total_chunks = int(post.get("total_chunks"))
+    except (TypeError, ValueError):
+        return web.json_response({"error": "Invalid chunk parameters"}, status=400)
+    if file is None or not isinstance(filename, str):
+        return web.json_response({"error": "Missing file or filename"}, status=400)
 
     upload_dir = os.path.join(folder_paths.get_input_directory(), "whatdreamscost")
     os.makedirs(upload_dir, exist_ok=True)
 
     # Sanitize filename to prevent path traversal attacks (e.g. ../../etc/passwd)
     filename = os.path.basename(filename)
-    file_path = os.path.join(upload_dir, filename)
+    file_path = safe_join(upload_dir, filename)
 
-    # Belt-and-suspenders: confirm the resolved path is still inside the upload directory
-    if not os.path.realpath(file_path).startswith(os.path.realpath(upload_dir)):
+    if file_path is None:
         return web.json_response({"error": "Invalid filename"}, status=400)
 
     # Append chunk to file (write fresh on first chunk, append on subsequent)

@@ -8,11 +8,26 @@ from server import PromptServer
 from aiohttp import web
 import comfy.utils
 
+from .security_utils import is_same_origin_request, safe_join
+
+# Only these extensions may be served/written through the routes below, limiting the blast
+# radius of the arbitrary-path preview feature and the chunked upload endpoint.
+_ALLOWED_VIDEO_EXTENSIONS = ('.mp4', '.webm', '.mkv', '.avi', '.mov', '.m4v', '.flv', '.wmv')
+
 # Custom API route to serve video files from anywhere on the user's system for the frontend preview
 @PromptServer.instance.routes.get("/video_ui_custom_view")
 async def custom_view(request):
+    if not is_same_origin_request(request):
+        return web.Response(status=403, text="Forbidden")
+
     file_path = request.query.get("filename", "")
-    if os.path.exists(file_path) and os.path.isfile(file_path):
+    if not file_path:
+        return web.Response(status=400, text="Missing filename")
+    # Check the extension on the resolved path so a symlink named x.mp4 can't expose other files.
+    file_path = os.path.realpath(file_path)
+    if not file_path.lower().endswith(_ALLOWED_VIDEO_EXTENSIONS):
+        return web.Response(status=400, text="Unsupported file type")
+    if os.path.isfile(file_path):
         return web.FileResponse(file_path)
     return web.Response(status=404, text="File not found")
 
@@ -26,15 +41,30 @@ def _read_and_write_file_chunk(file, file_path, mode):
 # Custom API route for Chunked Uploads to bypass the 413 Payload Too Large error
 @PromptServer.instance.routes.post("/video_ui_upload_chunk")
 async def upload_chunk(request):
+    if not is_same_origin_request(request):
+        return web.Response(status=403, text="Forbidden")
+
     post = await request.post()
     file = post.get("file")
     filename = post.get("filename")
-    chunk_index = int(post.get("chunk_index"))
-    total_chunks = int(post.get("total_chunks"))
+    try:
+        chunk_index = int(post.get("chunk_index"))
+        total_chunks = int(post.get("total_chunks"))
+    except (TypeError, ValueError):
+        return web.json_response({"error": "Invalid chunk parameters"}, status=400)
+    if file is None or not isinstance(filename, str):
+        return web.json_response({"error": "Missing file or filename"}, status=400)
 
     upload_dir = folder_paths.get_input_directory()
     os.makedirs(upload_dir, exist_ok=True)
-    file_path = os.path.join(upload_dir, filename)
+
+    # Resolve under upload_dir only, rejecting any path traversal in the client-supplied filename.
+    safe_filename = os.path.basename(filename)
+    if not safe_filename.lower().endswith(_ALLOWED_VIDEO_EXTENSIONS):
+        return web.json_response({"error": "Unsupported file type"}, status=400)
+    file_path = safe_join(upload_dir, safe_filename)
+    if file_path is None:
+        return web.json_response({"error": "Invalid filename"}, status=400)
 
     # Append to file if it's not the first chunk, otherwise write new
     mode = "ab" if chunk_index > 0 else "wb"
@@ -44,7 +74,7 @@ async def upload_chunk(request):
     await loop.run_in_executor(None, _read_and_write_file_chunk, file, file_path, mode)
 
     if chunk_index == total_chunks - 1:
-        return web.json_response({"name": filename})
+        return web.json_response({"name": safe_filename})
     return web.json_response({"status": "ok"})
 
 
